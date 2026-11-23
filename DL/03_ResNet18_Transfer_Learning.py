@@ -334,3 +334,25 @@ with mlflow.start_run(run_name="ResNet18_Transfer_Learning"):
 
 print("ResNet18 model successfully logged!")
 
+# Freeze everything first
+for param in model.parameters():
+    param.requires_grad = False
+
+# Unfreeze the final residual block
+for param in model.layer4.parameters():
+    param.requires_grad = True
+
+# Keep the classification head trainable
+for param in model.fc.parameters():
+    param.requires_grad = True
+
+optimizer = torch.optim.Adam([
+    {
+        "params": model.layer4.parameters(),
+        "lr": 0.0001
+    },
+    {
+        "params": model.fc.parameters(),
+        "lr": 0.001
+    }
+])
