@@ -14,6 +14,7 @@ from sklearn.metrics import (
 
 import mlflow
 import mlflow.sklearn
+from mlflow.models import infer_signature
 
 print("Libraries imported successfully!")
 print("MLflow version:", mlflow.__version__)
@@ -137,9 +138,20 @@ for name, model in models.items():
         mlflow.log_metric("mae", mae)
         mlflow.log_metric("r2", r2)
 
+        input_example = X_train.head(5)
+
+        predictions_example = model.predict(input_example)
+
+        signature = infer_signature(
+            input_example,
+            predictions_example
+        )
+
         mlflow.sklearn.log_model(
             model,
-            artifact_path="model"
+            name="model",
+            signature=signature,
+            input_example=input_example
         )
 
         print(f"Logged experiment: {name}")
