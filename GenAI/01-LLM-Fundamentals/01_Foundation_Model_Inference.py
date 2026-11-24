@@ -13,7 +13,7 @@
 # 1. INSTALL DEPENDENCIES
 # ============================================================
 
-%pip install -U openai
+#%pip install -U openai
 
 
 # ============================================================
@@ -101,18 +101,84 @@ response = client.chat.completions.create(
     model=MODEL_ENDPOINT,
     messages=messages,
     temperature=inference_config["temperature"],
-    max_tokens=inference_config["max_tokens"],
+    max_tokens=1500,
     top_p=inference_config["top_p"]
 )
 
+# ============================================================
+# RESPONSE DIAGNOSTICS
+# ============================================================
+
 message = response.choices[0].message
 
-print("\nInference completed.")
+print("Finish reason:", response.choices[0].finish_reason)
+print("Content:", repr(message.content))
+
+if response.usage:
+    print("Prompt tokens:", response.usage.prompt_tokens)
+    print("Completion tokens:", response.usage.completion_tokens)
+    print("Total tokens:", response.usage.total_tokens)
+
+content = message.content
+
+print("\n" + "=" * 70)
+print("QWEN RESPONSE DIAGNOSTICS")
+print("=" * 70)
+
 print("Response ID:", response.id)
 print("Model:", response.model)
 print("Finish reason:", response.choices[0].finish_reason)
-print("Content type:", type(message.content).__name__)
+print("Message type:", type(message).__name__)
+print("Content type:", type(content).__name__)
 
+print("\nRaw content:")
+print(repr(content))
+
+
+def inspect_structure(value, path="content", depth=0):
+
+    indent = "  " * depth
+
+    if depth > 8:
+        return
+
+    if isinstance(value, dict):
+
+        print(f"{indent}{path}: dict")
+        print(f"{indent}Keys: {list(value.keys())}")
+
+        if value.get("type") == "reasoning":
+            print(f"{indent}Reasoning block skipped.")
+            return
+
+        for key, item in value.items():
+            inspect_structure(item, f"{path}.{key}", depth + 1)
+
+    elif isinstance(value, list):
+
+        print(f"{indent}{path}: list ({len(value)} items)")
+
+        for index, item in enumerate(value):
+            inspect_structure(item, f"{path}[{index}]", depth + 1)
+
+    elif isinstance(value, str):
+
+        print(f"{indent}{path}: string")
+
+        if any(
+            key in path.lower()
+            for key in ("text", "output_text", "content")
+        ):
+            print(f"{indent}Value: {value[:2000]}")
+
+    else:
+        print(f"{indent}{path}: {type(value).__name__}")
+
+
+print("\nNested structure:")
+inspect_structure(content)
+
+print("\n" + "=" * 70)
 
 # ============================================================
 # 7. INSPECT RESPONSE STRUCTURE
