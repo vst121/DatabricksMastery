@@ -413,6 +413,7 @@ context = "\n\n".join(
 )
 
 
+
 # ============================================================
 # 10. GROUNDED GENERATION
 # ============================================================
@@ -455,49 +456,78 @@ response = client.chat.completions.create(
 )
 
 
-# Extract user-facing text.
-message_content = response.choices[0].message.content
+# ============================================================
+# NORMALIZE MODEL RESPONSE
+# ============================================================
 
-if isinstance(message_content, str):
+def extract_text(value):
+    """Extract visible text while excluding reasoning blocks."""
 
-    answer = message_content
+    if isinstance(value, str):
+        return value
 
-elif isinstance(message_content, list):
+    if isinstance(value, list):
+        parts = []
 
-    answer_parts = []
+        for item in value:
+            extracted = extract_text(item)
+            if extracted:
+                parts.append(extracted)
 
-    for block in message_content:
+        return "\n".join(parts)
 
-        if isinstance(block, dict):
-            block_type = block.get("type")
-            block_text = block.get("text")
-        else:
-            block_type = getattr(block, "type", None)
-            block_text = getattr(block, "text", None)
+    if isinstance(value, dict):
 
-        if (
-            block_type in ("text", "output_text")
-            and isinstance(block_text, str)
-        ):
-            answer_parts.append(block_text)
+        if value.get("type") in ("reasoning", "thinking"):
+            return ""
 
-    answer = "\n".join(answer_parts)
+        for key in ("text", "output_text"):
+            if isinstance(value.get(key), str):
+                return value[key]
+
+        for key in ("content", "parts"):
+            if key in value:
+                extracted = extract_text(value[key])
+                if extracted:
+                    return extracted
+
+        return ""
+
+    # Handle SDK objects with structured content.
+    block_type = getattr(value, "type", None)
+
+    if block_type in ("reasoning", "thinking"):
+        return ""
+
+    for attribute in ("text", "output_text", "content"):
+        item = getattr(value, attribute, None)
+
+        if item is not None:
+            extracted = extract_text(item)
+            if extracted:
+                return extracted
+
+    return ""
+
+
+message = response.choices[0].message
+
+answer = extract_text(message.content).strip()
+
+print("\nResponse ID:", response.id)
+print("Finish reason:", response.choices[0].finish_reason)
+
+if answer:
+    print("\nGenerated answer:")
+    print("=" * 60)
+    print(answer)
+    print("=" * 60)
 
 else:
-    answer = ""
-
-
-if not answer.strip():
-    raise ValueError(
-        "No user-facing text found in the LLM response. "
-        "Inspect the response structure before proceeding."
-    )
-
-
-print("\nGenerated answer:")
-print("=" * 60)
-print(answer)
-print("=" * 60)
+    print("\nNo recognizable text block found.")
+    print("Response content type:", type(message.content).__name__)
+    print("Raw response content:")
+    print(repr(message.content))
 
 
 # ============================================================
