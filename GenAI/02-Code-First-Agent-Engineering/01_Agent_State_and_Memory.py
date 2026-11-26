@@ -1,82 +1,128 @@
 
 """
 Agent State and Memory
+
 Experiments:
 1. Conversation state management
-2. Working memory extraction
-3. Persistent memory with Delta tables
-4. Memory retrieval and injection into prompts
-5. State isolation between conversations
+2. Working memory
+3. Persistent memory with Delta Lake
+4. Memory extraction using an LLM
+5. Memory retrieval and prompt injection
+6. Cross-conversation memory
+7. Conversation isolation
 """
 
 import json
+import re
 import uuid
 from datetime import datetime, timezone
 from typing import Any
 
 from openai import OpenAI
 from pydantic import BaseModel, Field
-
-
-# ============================================================
-# 1. Configuration
-# ============================================================
-
+from pyspark.sql import functions as F
+from delta.tables import DeltaTable
 from databricks.sdk import WorkspaceClient
-from openai import OpenAI
+
+
+# ============================================================
+# 1. Configuration and Authentication
+# ============================================================
 
 MODEL_ENDPOINT = "system.ai.qwen35-122b-a10b"
 
 workspace = WorkspaceClient()
 
+headers = workspace.config.authenticate()
+token = headers["Authorization"].replace("Bearer ", "")
+
+workspace_url = workspace.config.host.rstrip("/")
+
 client = OpenAI(
-    api_key=workspace.config.authenticate()["Authorization"].replace(
-        "Bearer ", ""
-    ),
-    base_url=(
-        f"https://{workspace.config.host}"
-        "/ai-gateway/mlflow/v1"
-    ),
+    api_key=token,
+    base_url=f"{workspace_url}/ai-gateway/mlflow/v1",
+    timeout=60.0,
+    max_retries=2,
 )
 
 current_user = spark.sql(
     "SELECT current_user()"
 ).first()[0]
 
-MEMORY_TABLE = "agent_memory"
+context = spark.sql("""
+    SELECT current_catalog() AS catalog,
+           current_schema() AS schema
+""").first()
+
+CATALOG = context["catalog"]
+SCHEMA = context["schema"]
+
+def quote_identifier(value):
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value):
+        raise ValueError(f"Invalid SQL identifier: {value}")
+    return f"`{value}`"
+
+MEMORY_TABLE = (
+    f"{quote_identifier(CATALOG)}."
+    f"{quote_identifier(SCHEMA)}."
+    f"`agent_memory`"
+)
+
+print("Workspace:", workspace_url)
+print("Current user:", current_user)
+print("Memory table:", MEMORY_TABLE)
 
 
 # ============================================================
-# 2. LLM Response Extraction
+# 2. LLM Utilities
 # ============================================================
+
 
 def extract_text(value: Any) -> str:
+
+    if value is None:
+        return ""
+
     if isinstance(value, str):
-        return value
+        return value.strip()
 
     if isinstance(value, list):
-        parts = [extract_text(item) for item in value]
+        parts = [
+            extract_text(item)
+            for item in value
+        ]
         return "\n".join(part for part in parts if part)
 
     if isinstance(value, dict):
-        if value.get("type") in ("reasoning", "thinking"):
+
+        block_type = value.get("type")
+
+        if block_type in ("reasoning", "thinking"):
             return ""
 
         for key in ("text", "output_text"):
-            if isinstance(value.get(key), str):
-                return value[key]
+            item = value.get(key)
+
+            if isinstance(item, str) and item.strip():
+                return item.strip()
 
         for key in ("content", "parts"):
             if key in value:
                 return extract_text(value[key])
 
-    if getattr(value, "type", None) in ("reasoning", "thinking"):
+        return ""
+
+    block_type = getattr(value, "type", None)
+
+    if block_type in ("reasoning", "thinking"):
         return ""
 
     for attribute in ("text", "output_text", "content"):
         item = getattr(value, attribute, None)
+
         if item is not None:
             result = extract_text(item)
+
             if result:
                 return result
 
@@ -84,22 +130,62 @@ def extract_text(value: Any) -> str:
 
 
 def ask_llm(messages, temperature=0.2):
+
     response = client.chat.completions.create(
         model=MODEL_ENDPOINT,
         messages=messages,
         temperature=temperature,
-        max_tokens=700,
+        max_tokens=1200,
     )
 
-    message = response.choices[0].message
-    return extract_text(message.content)
+    choice = response.choices[0]
+    message = choice.message
+
+    answer = extract_text(message.content)
+
+    if answer:
+        return answer
+
+    # Diagnostic information without exposing model reasoning.
+    print("\nLLM RESPONSE DIAGNOSTICS")
+    print("Response ID:", response.id)
+    print("Model:", response.model)
+    print("Finish reason:", choice.finish_reason)
+    print("Message role:", message.role)
+    print("Content type:", type(message.content).__name__)
+    print("Content representation:", repr(message.content)[:2000])
+    print("Refusal:", getattr(message, "refusal", None))
+    print(
+        "Tool calls:",
+        len(message.tool_calls or [])
+        if message.tool_calls else 0
+    )
+
+    return ""
+
+
+def parse_json_response(raw):
+
+    cleaned = raw.strip()
+
+    if cleaned.startswith("```"):
+        cleaned = re.sub(
+            r"^```(?:json)?\s*",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+
+    return json.loads(cleaned)
 
 
 # ============================================================
-# 3. Structured Memory Model
+# 3. Memory Data Models
 # ============================================================
 
 class MemoryItem(BaseModel):
+
     key: str = Field(min_length=1, max_length=100)
     value: str = Field(min_length=1, max_length=1000)
     category: str = "general"
@@ -107,6 +193,7 @@ class MemoryItem(BaseModel):
 
 
 class MemoryExtraction(BaseModel):
+
     memories: list[MemoryItem] = Field(default_factory=list)
 
 
@@ -115,34 +202,47 @@ class MemoryExtraction(BaseModel):
 # ============================================================
 
 class AgentState:
+
     def __init__(self, conversation_id=None):
-        self.conversation_id = conversation_id or str(uuid.uuid4())
+
+        self.conversation_id = (
+            conversation_id or str(uuid.uuid4())
+        )
+
         self.messages = []
         self.working_memory = {}
 
     def add_message(self, role, content):
+
         if role not in ("user", "assistant"):
             raise ValueError("Unsupported conversation role.")
 
         self.messages.append({
             "role": role,
             "content": content,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": datetime.now(
+                timezone.utc
+            ).isoformat(),
         })
 
     def add_memory(self, memory: MemoryItem):
-        self.working_memory[memory.key] = memory.model_dump()
+
+        self.working_memory[memory.key] = (
+            memory.model_dump()
+        )
 
     def get_history(self):
+
         return [
             {
-                "role": message["role"],
-                "content": message["content"],
+                "role": item["role"],
+                "content": item["content"],
             }
-            for message in self.messages
+            for item in self.messages
         ]
 
     def summary(self):
+
         return {
             "conversation_id": self.conversation_id,
             "message_count": len(self.messages),
@@ -151,10 +251,11 @@ class AgentState:
 
 
 # ============================================================
-# 5. Persistent Memory Storage
+# 5. Persistent Memory: Delta Lake
 # ============================================================
 
 def create_memory_table():
+
     spark.sql(f"""
         CREATE TABLE IF NOT EXISTS {MEMORY_TABLE} (
             memory_id STRING,
@@ -170,42 +271,39 @@ def create_memory_table():
         USING DELTA
     """)
 
+    print("Memory table ready.")
+
 
 def save_memory(user_id, memory: MemoryItem):
-    """
-    Save a memory or update the existing active memory
-    with the same user_id and memory_key.
-    """
 
-    from delta.tables import DeltaTable
-
-    memory_id = str(uuid.uuid4())
+    if not spark.catalog.tableExists(
+        f"{CATALOG}.{SCHEMA}.agent_memory"
+    ):
+        create_memory_table()
 
     source = spark.createDataFrame(
         [(
-            memory_id,
+            str(uuid.uuid4()),
             user_id,
             memory.key,
             memory.value,
             memory.category,
             memory.confidence,
         )],
-        schema=(
-            "memory_id STRING, "
-            "user_id STRING, "
-            "memory_key STRING, "
-            "memory_value STRING, "
-            "category STRING, "
-            "confidence DOUBLE"
-        ),
+        schema="""
+            memory_id STRING,
+            user_id STRING,
+            memory_key STRING,
+            memory_value STRING,
+            category STRING,
+            confidence DOUBLE
+        """,
     )
 
-    now = datetime.now(timezone.utc)
-
-    if not spark.catalog.tableExists(MEMORY_TABLE):
-        create_memory_table()
-
-    target = DeltaTable.forName(spark, MEMORY_TABLE)
+    target = DeltaTable.forName(
+        spark,
+        f"{CATALOG}.{SCHEMA}.agent_memory",
+    )
 
     (
         target.alias("target")
@@ -239,13 +337,21 @@ def save_memory(user_id, memory: MemoryItem):
 
 
 def retrieve_memories(user_id, limit=20):
+
+    if not spark.catalog.tableExists(
+        f"{CATALOG}.{SCHEMA}.agent_memory"
+    ):
+        return []
+
     rows = (
-        spark.table(MEMORY_TABLE)
+        spark.table(f"{CATALOG}.{SCHEMA}.agent_memory")
         .filter(
-            (spark.table(MEMORY_TABLE).user_id == user_id)
-            & (spark.table(MEMORY_TABLE).is_active == True)
+            (F.col("user_id") == user_id)
+            & (F.col("is_active") == True)
         )
-        .orderBy("updated_at", ascending=False)
+        .orderBy(
+            F.col("updated_at").desc()
+        )
         .limit(limit)
         .collect()
     )
@@ -266,32 +372,28 @@ def retrieve_memories(user_id, limit=20):
 # ============================================================
 
 def extract_memories(conversation_history):
-    """
-    Ask the LLM to identify useful, explicit, reusable facts.
-    Treat extracted memories as candidates, not trusted facts.
-    """
 
-    prompt = """
+    system_prompt = """
 You are a memory extraction component.
 
-Extract only explicit, useful, reusable facts from the
-conversation.
+Extract explicit, useful and reusable facts.
 
 Rules:
-- Do not invent facts.
+- Never invent facts.
 - Do not infer personal characteristics.
 - Ignore temporary requests and casual conversation.
-- Do not store passwords, secrets, credentials, or tokens.
-- Prefer stable preferences, project facts, and decisions.
+- Never store passwords, credentials, API keys or secrets.
+- Prefer stable project facts, preferences and decisions.
 - Return an empty memories list if nothing is worth retaining.
 
-Return JSON in this format:
+Return valid JSON only:
+
 {
   "memories": [
     {
-      "key": "preferred_language",
-      "value": "English",
-      "category": "preference",
+      "key": "project_backend",
+      "value": "Python with FastAPI",
+      "category": "project",
       "confidence": 0.99
     }
   ]
@@ -299,30 +401,37 @@ Return JSON in this format:
 """
 
     messages = [
-        {"role": "system", "content": prompt},
+        {
+            "role": "system",
+            "content": system_prompt,
+        },
         {
             "role": "user",
             "content": json.dumps(conversation_history),
         },
     ]
 
-    raw = ask_llm(messages)
-
     try:
-        data = json.loads(raw)
-        extracted = MemoryExtraction.model_validate(data)
-        return extracted.memories
+
+        raw = ask_llm(messages)
+        data = parse_json_response(raw)
+
+        result = MemoryExtraction.model_validate(data)
+
+        return result.memories
+
     except Exception as error:
+
         print("Memory extraction failed:", str(error))
-        print("Model output:", raw[:1000])
         return []
 
 
 # ============================================================
-# 7. Memory Injection
+# 7. Memory Context Construction
 # ============================================================
 
-def build_context(memories):
+def build_memory_context(memories):
+
     if not memories:
         return "No relevant stored memories."
 
@@ -332,43 +441,39 @@ def build_context(memories):
     )
 
 
+# ============================================================
+# 8. Agent Execution
+# ============================================================
+
 def agent_turn(state, user_message, user_id):
-    """
-    Execute one agent turn using conversation history
-    and previously stored memories.
-    """
 
     state.add_message("user", user_message)
 
-    persistent_memories = retrieve_memories(user_id)
+    memories = retrieve_memories(user_id)
 
     system_prompt = f"""
 You are a helpful AI assistant.
 
-Use the following stored user context when relevant:
+Relevant stored context:
 
-{build_context(persistent_memories)}
+{build_memory_context(memories)}
 
-Rules:
-- Do not claim that stored information is always current.
-- Prefer the latest information provided in the conversation.
+Instructions:
+- Use stored context when relevant.
+- Never assume stored information is always current.
+- Prioritize the latest user statement.
 - Do not invent personal details.
-- If memory conflicts with the user's latest statement,
-  prioritize the latest statement.
 """
 
     messages = [
-        {"role": "system", "content": system_prompt},
+        {
+            "role": "system",
+            "content": system_prompt,
+        },
         *state.get_history(),
     ]
 
     answer = ask_llm(messages)
-
-    if not answer:
-        answer = (
-            "I could not generate a response. "
-            "Please try again."
-        )
 
     state.add_message("assistant", answer)
 
@@ -376,7 +481,7 @@ Rules:
 
 
 # ============================================================
-# 8. Experiment: Conversation and Working Memory
+# 9. Experiment 1: Conversation State
 # ============================================================
 
 print("\n" + "=" * 60)
@@ -404,7 +509,7 @@ print(json.dumps(state.summary(), indent=2))
 
 
 # ============================================================
-# 9. Experiment: Extract and Persist Memory
+# 10. Experiment 2: Extract and Save Memory
 # ============================================================
 
 print("\n" + "=" * 60)
@@ -413,31 +518,40 @@ print("=" * 60)
 
 create_memory_table()
 
-candidate_memories = extract_memories(state.get_history())
+candidate_memories = extract_memories(
+    state.get_history()
+)
+
+print("Candidate memories:", len(candidate_memories))
 
 for memory in candidate_memories:
+
     print(memory.model_dump())
 
-    # Demonstration only: in production, add a policy
-    # and user-consent gate before persisting candidates.
+    # Demonstration policy.
+    # Production systems should require consent and
+    # validation before persisting extracted memories.
+
     if memory.confidence >= 0.80:
         save_memory(current_user, memory)
 
-print("\nStored memories:")
+print("\nPersistent memories:")
+
 stored_memories = retrieve_memories(current_user)
 
 print(json.dumps(stored_memories, indent=2))
 
 
 # ============================================================
-# 10. Experiment: Memory Across Conversations
+# 11. Experiment 3: Cross-Conversation Memory
 # ============================================================
 
 print("\n" + "=" * 60)
 print("EXPERIMENT 3: CROSS-CONVERSATION MEMORY")
 print("=" * 60)
 
-# New state simulates a separate conversation/session.
+# Simulate a completely new conversation.
+
 new_state = AgentState()
 
 question = (
@@ -456,7 +570,7 @@ print("\nAssistant:", answer)
 
 
 # ============================================================
-# 11. Experiment: State Isolation
+# 12. Experiment 4: Conversation Isolation
 # ============================================================
 
 print("\n" + "=" * 60)
@@ -479,11 +593,11 @@ print("Conversation B messages:", len(another_state.messages))
 assert state.conversation_id != another_state.conversation_id
 assert len(another_state.messages) == 1
 
-print("\nState isolation verified.")
+print("\nConversation isolation verified.")
 
 
 # ============================================================
-# 12. Final Summary
+# 13. Final Summary
 # ============================================================
 
 print("\n" + "=" * 60)
@@ -493,6 +607,7 @@ print("=" * 60)
 print("Conversation state: implemented")
 print("Working memory: implemented")
 print("Persistent Delta memory: implemented")
+print("Memory extraction: implemented")
 print("Memory retrieval: implemented")
 print("Cross-conversation context: demonstrated")
 print("Conversation isolation: verified")
